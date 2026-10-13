@@ -1,0 +1,29 @@
+name: Test France
+ 
+# À lancer à la main uniquement : télécharge les deux sources françaises
+# et affiche les prix calculés. Aucun envoi, aucune modification du cache.
+on:
+  workflow_dispatch:
+ 
+permissions:
+  contents: read
+ 
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+ 
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+ 
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+ 
+      - name: Tester les sources françaises
+        run: python test_france.py
