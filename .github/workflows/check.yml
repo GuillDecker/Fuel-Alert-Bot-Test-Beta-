@@ -1,0 +1,96 @@
+name: Fuel Price Checker
+ 
+# Chaîne auto-relancée : chaque run vérifie les prix, attend le prochain
+# multiple de 5 minutes, puis lance le run suivant.
+on:
+  workflow_dispatch:
+    inputs:
+      revived:
+        description: "Usage interne (watchdog) — laisser à false"
+        required: false
+        default: "false"
+      last_seen:
+        description: "Usage interne (watchdog) — laisser vide"
+        required: false
+        default: ""
+ 
+permissions:
+  contents: write   # sauvegarde du cache
+  actions: write    # lancement du run suivant
+ 
+# Un seul run à la fois : impossible d'avoir deux chaînes en parallèle.
+concurrency:
+  group: fuel-price-checker
+  cancel-in-progress: false
+ 
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+ 
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+ 
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+ 
+      - name: Run bot
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_ALERT_URL: ${{ secrets.NTFY_ALERT_URL }}
+          MAIL_ADDRESS: ${{ secrets.MAIL_ADDRESS }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+          REVIVED: ${{ inputs.revived }}
+          LAST_SEEN: ${{ inputs.last_seen }}
+        run: python bot.py
+ 
+      - name: Save cache
+        if: ${{ !cancelled() }}
+        run: |
+          [ -f prices_cache.json ] || exit 0
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          files="prices_cache.json"
+          [ -f history.csv ] && files="$files history.csv"
+          git add $files
+          if git diff --cached --quiet; then
+            echo "Aucun changement à sauvegarder."
+            exit 0
+          fi
+          git commit -m "chore: update prices cache"
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "Push refusé, nouvelle tentative..."
+            git pull --rebase
+            sleep 5
+          done
+          exit 1
+ 
+      - name: Lancer le run suivant
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NTFY_ALERT_URL: ${{ secrets.NTFY_ALERT_URL }}
+          MAIL_ADDRESS: ${{ secrets.MAIL_ADDRESS }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+        run: |
+          now=$(date +%s)
+          next=$(( (now / 300 + 1) * 300 ))
+          echo "Run suivant à $(TZ=Europe/Luxembourg date -d "@$next" '+%H:%M:%S'), dans $(( next - now )) s."
+          sleep $(( next - now ))
+          for attempt in 1 2 3; do
+            if gh workflow run check.yml --ref "$GITHUB_REF_NAME"; then
+              echo "Run suivant lancé."
+              exit 0
+            fi
+            sleep 10
+          done
+          python bot.py --chain-error
+          exit 1
