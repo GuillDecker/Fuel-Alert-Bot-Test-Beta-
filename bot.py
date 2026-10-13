@@ -5,20 +5,25 @@ Sources :
   - carbu.com/luxembourg : diesel, SP95, SP98 (Luxembourg)
   - petrol.lu            : mazout de chauffage (Luxembourg)
   - SPF Économie         : diesel, SP95, SP98, mazout (Belgique)
+  - prix-carburants.gouv.fr : prix typique (médiane) hors autoroute (France)
+  - Bulletin pétrolier UE   : mazout, moyenne nationale hebdomadaire (France)
 
+La France est affichée à titre de comparaison : elle ne déclenche jamais de notification.
 Chaque source est indépendante : si l'une tombe, les autres continuent.
 """
 
 import csv
+import io
 import json
 import os
 import re
 import smtplib
 import ssl
+import statistics
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from email.message import EmailMessage
 from pathlib import Path
@@ -55,6 +60,10 @@ NTFY_FAIL_THRESHOLD = 3      # 3 notifs refusées d'affilée ≈ 15 min → aler
 REMINDER_HOURS = 24          # rappel si un incident dure
 CHAIN_GAP_ALERT_MIN = 10     # trou dans la chaîne au-delà duquel on alerte
 
+FR_MAX_AGE_DAYS = 7          # prix de station plus vieux → ignoré (station fermée, abandonnée)
+FR_MIN_STATIONS = 500        # en dessous, la médiane n'est pas fiable → échec de la source
+FR_FAIL_THRESHOLD = 3        # la France n'est interrogée qu'à chaque notif → 3 échecs d'affilée
+
 FUELS = ("diesel", "sp95", "sp98", "mazout")
 CARBURANTS = ("diesel", "sp95", "sp98")
 FUEL_LABELS = {"diesel": "Diesel", "sp95": "SP95", "sp98": "SP98", "mazout": "Mazout"}
@@ -75,7 +84,29 @@ SOURCES = {
         "url": "https://petrolprices.economie.fgov.be/petrolprices/?locale=fr",
         "country": "be",
     },
+    "fr_stations": {
+        "label": "prix-carburants.gouv.fr (France)",
+        "url": "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/"
+               "prix-des-carburants-en-france-flux-instantane-v2/exports/json",
+        "params": {"select": "pop,gazole_prix,gazole_maj,gazole_rupture_type,"
+                             "e10_prix,e10_maj,e10_rupture_type,"
+                             "sp98_prix,sp98_maj,sp98_rupture_type"},
+        "timeout": (10, 90),
+        "country": "fr",
+        "display_only": True,
+    },
+    "fr_fioul": {
+        "label": "Bulletin pétrolier UE (mazout France)",
+        "url": "https://energy.ec.europa.eu/document/download/"
+               "264c2d0f-f161-4ea3-a777-78faae59bea0_en?filename="
+               "Weekly%20Oil%20Bulletin%20Weekly%20prices%20with%20Taxes%20-%202024-02-19.xlsx",
+        "country": "fr",
+        "display_only": True,
+    },
 }
+
+MAIN_SOURCES = ("carbu_lu", "petrol_lu", "spf_be")   # déclenchent les notifs
+FR_SOURCES = ("fr_stations", "fr_fioul")             # affichage seulement
 
 
 class SourceError(Exception):
@@ -157,11 +188,16 @@ def own_rows(table):
 
 
 # ─── Récupération ───────────────────────────────────────────────────
-def fetch(url):
+def fetch(url, timeout=REQUEST_TIMEOUT, params=None):
     last_error = None
     for attempt in range(1, REQUEST_ATTEMPTS + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            r = requests.get(url, headers=HEADERS, timeout=timeout, params=params)
+            if r.status_code == 400 and params:
+                # Paramètre refusé par l'API : on retente sans filtre plutôt que d'échouer.
+                log(f"  ⚠️ Paramètres refusés par {url} — nouvelle tentative sans filtre.")
+                params = None
+                r = requests.get(url, headers=HEADERS, timeout=timeout)
             r.raise_for_status()
             return r.content
         except requests.RequestException as e:
@@ -289,27 +325,120 @@ def parse_spf_be(html):
     return prices, {f: valid_from for f in FUELS}
 
 
-PARSERS = {"carbu_lu": parse_carbu_lu, "petrol_lu": parse_petrol_lu, "spf_be": parse_spf_be}
+def parse_fr_stations(raw):
+    """Flux officiel des ~10 000 stations françaises : médiane des prix des stations
+    hors autoroute (pop = "R"), mis à jour depuis moins de FR_MAX_AGE_DAYS jours."""
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise SourceError(f"Réponse illisible de prix-carburants.gouv.fr : {e}")
+    if isinstance(data, dict):
+        data = data.get("results", [])
+    if not isinstance(data, list):
+        raise SourceError("Format inattendu des données de prix-carburants.gouv.fr")
+
+    keys = {"diesel": "gazole", "sp95": "e10", "sp98": "sp98"}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FR_MAX_AGE_DAYS)
+    values = {fuel: [] for fuel in keys}
+    for station in data:
+        if not isinstance(station, dict) or station.get("pop") != "R":
+            continue
+        for fuel, key in keys.items():
+            price, updated = station.get(f"{key}_prix"), station.get(f"{key}_maj")
+            if price is None or not updated:
+                continue
+            if station.get(f"{key}_rupture_type") == "temporaire":
+                continue
+            try:
+                when = datetime.fromisoformat(str(updated))
+                price = Decimal(str(price))
+            except (ValueError, ArithmeticError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if when < cutoff or not (PRICE_MIN <= price <= PRICE_MAX):
+                continue  # prix périmé ou aberrant d'une station isolée : ignoré
+            values[fuel].append(price)
+
+    prices = {}
+    for fuel, vals in values.items():
+        if len(vals) < FR_MIN_STATIONS:
+            raise SourceError(f"Trop peu de stations à jour pour le {FUEL_LABELS[fuel]} "
+                              f"sur prix-carburants.gouv.fr ({len(vals)}, minimum {FR_MIN_STATIONS})")
+        prices[fuel] = check_range("fr_stations", fuel, statistics.median(vals))
+    log("  🇫🇷 Stations retenues : "
+        + ", ".join(f"{FUEL_LABELS[f]} {len(v)}" for f, v in values.items()))
+    today = now_local().date()
+    return prices, {fuel: today for fuel in prices}
+
+
+def parse_fr_fioul(raw):
+    """Bulletin pétrolier hebdomadaire de la Commission européenne (prix avec taxes) :
+    ligne « France », colonne « Gas oil de chauffage », date du relevé en tête de fichier."""
+    from openpyxl import load_workbook
+    try:
+        workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as e:
+        raise SourceError(f"Fichier du Bulletin pétrolier illisible : {e!r}")
+    rows = list(workbook.worksheets[0].iter_rows(values_only=True))
+
+    col = None
+    for row in rows[:5]:
+        for i, cell in enumerate(row):
+            text = str(cell).lower() if cell is not None else ""
+            if "chauffage" in text or "heating gas oil" in text:
+                col = i
+                break
+        if col is not None:
+            break
+    if col is None:
+        raise SourceError("Colonne « Gas oil de chauffage » introuvable dans le Bulletin pétrolier")
+
+    bulletin_date, divisor = None, Decimal(1)
+    for row in rows[:5]:
+        for cell in row:
+            if isinstance(cell, datetime) and bulletin_date is None:
+                bulletin_date = cell.date()
+        unit = row[col] if len(row) > col else None
+        if isinstance(unit, str) and unit.strip().lower().replace(" ", "") == "1000l":
+            divisor = Decimal(1000)
+
+    for row in rows:
+        if row and isinstance(row[0], str) and row[0].strip().lower() == "france":
+            value = row[col] if len(row) > col else None
+            if value is None:
+                raise SourceError("Prix du fioul France absent du Bulletin pétrolier")
+            price = Decimal(str(value)) / divisor
+            return ({"mazout": check_range("fr_fioul", "mazout", price)},
+                    {"mazout": bulletin_date})
+    raise SourceError("Ligne « France » introuvable dans le Bulletin pétrolier")
+
+
+PARSERS = {"carbu_lu": parse_carbu_lu, "petrol_lu": parse_petrol_lu, "spf_be": parse_spf_be,
+           "fr_stations": parse_fr_stations, "fr_fioul": parse_fr_fioul}
 
 
 def fetch_source(name):
+    source = SOURCES[name]
     try:
-        return PARSERS[name](fetch(SOURCES[name]["url"]))
+        raw = fetch(source["url"], timeout=source.get("timeout", REQUEST_TIMEOUT),
+                    params=source.get("params"))
+        return PARSERS[name](raw)
     except SourceError as e:
         return e
     except Exception as e:  # bug de parsing inattendu : traité comme un échec de source
         return SourceError(f"Erreur inattendue : {e!r}")
 
 
-def fetch_all():
-    with ThreadPoolExecutor(max_workers=len(SOURCES)) as pool:
-        futures = {name: pool.submit(fetch_source, name) for name in SOURCES}
+def fetch_all(names):
+    with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        futures = {name: pool.submit(fetch_source, name) for name in names}
         return {name: f.result() for name, f in futures.items()}
 
 
 # ─── Cache ──────────────────────────────────────────────────────────
 def empty_cache():
-    return {"version": 2, "prices": {"lu": {}, "be": {}}, "health": {}, "incidents": {}}
+    return {"version": 2, "prices": {"lu": {}, "be": {}, "fr": {}}, "health": {}, "incidents": {}}
 
 
 def load_cache():
@@ -324,8 +453,8 @@ def load_cache():
     if data.get("version") == 2:
         for key, value in empty_cache().items():
             data.setdefault(key, value)
-        data["prices"].setdefault("lu", {})
-        data["prices"].setdefault("be", {})
+        for country in ("lu", "be", "fr"):
+            data["prices"].setdefault(country, {})
         return data
 
     # Ancien format (version actuellement en prod) : {"lu": {...}, "be": {...}}
@@ -476,10 +605,13 @@ def update_source_health(cache, alerts, name, result, now):
         health["since"] = health["since"] or now.isoformat(timespec="seconds")
         health["last_error"] = str(result)
         log(f"  ❌ {source['label']} : {result} (échec n°{health['fails']})")
-        if result.immediate or health["fails"] >= FAIL_THRESHOLD:
+        threshold = FR_FAIL_THRESHOLD if source.get("display_only") else FAIL_THRESHOLD
+        if result.immediate or health["fails"] >= threshold:
             since = datetime.fromisoformat(health["since"])
             if result.immediate:
                 title = f"Prix aberrant sur {source['label']}"
+            elif source.get("display_only"):
+                title = f"{source['label']} en échec ({health['fails']} tentatives d'affilée)"
             else:
                 title = f"{source['label']} en échec depuis {minutes_between(since, now)} min"
             body = (f"Source : {source['label']}\n"
@@ -546,6 +678,32 @@ def date_line(flag, entries):
     return f"📅 {flag} {carb} · Mazout dès le {fmt_date(d('mazout'))}"
 
 
+def fr_date_line(entries):
+    def d(fuel):
+        entry = entries.get(fuel)
+        return entry["date"] if entry else None
+    return (f"📅 🇫🇷 Carburants relevés le {fmt_date(d('diesel'))} · "
+            f"Mazout : semaine du {fmt_date(d('mazout'))}")
+
+
+def fr_price_line(fuel, entry):
+    if entry is None:
+        return "🇫🇷 n/d"
+    label = "moyenne nationale" if fuel == "mazout" else "prix typique, hors autoroute"
+    return f"🇫🇷 {fmt_price(entry['value'])} ({label})"
+
+
+def trophy(entries):
+    """Pays le moins cher parmi ceux qui ont un prix (comparaison à 3 décimales)."""
+    names = {"lu": "🏆 Go Lux. !", "be": "🏆 Go Belgique !", "fr": "🏆 Go France !"}
+    prices = {c: trunc3(e["value"]) for c, e in entries.items() if e}
+    if len(prices) < 2:
+        return None
+    best = min(prices.values())
+    winners = [c for c, v in prices.items() if v == best]
+    return names[winners[0]] if len(winners) == 1 else "🤝 Égalité !"
+
+
 def price_line(flag, entry, old, changed):
     if entry is None:
         return f"{flag} n/d"
@@ -573,19 +731,17 @@ def build_notification(current, old_values, changed):
     lines = [subtitle, "",
              date_line("🇱🇺", current["lu"]),
              date_line("🇧🇪", current["be"]),
+             fr_date_line(current["fr"]),
              ""]
 
     for fuel, emoji, label in (("diesel", "🟡", "DIESEL"), ("sp95", "🟢", "SP95"),
                                ("sp98", "🔵", "SP98"), ("mazout", "🔥", "MAZOUT CHAUFFAGE")):
-        lu, be = current["lu"].get(fuel), current["be"].get(fuel)
-        if lu and be:
-            a, b = trunc3(lu["value"]), trunc3(be["value"])
-            trophy = "🏆 Go Lux. !" if a < b else "🏆 Go Belgique !" if b < a else "🤝 Égalité !"
-            lines.append(f"{emoji} {label} | {trophy}")
-        else:
-            lines.append(f"{emoji} {label}")
-        lines.append(price_line("🇱🇺", lu, old_values["lu"].get(fuel), ("lu", fuel) in changed))
-        lines.append(price_line("🇧🇪", be, old_values["be"].get(fuel), ("be", fuel) in changed))
+        entries = {c: current[c].get(fuel) for c in ("lu", "be", "fr")}
+        winner = trophy(entries)
+        lines.append(f"{emoji} {label} | {winner}" if winner else f"{emoji} {label}")
+        lines.append(price_line("🇱🇺", entries["lu"], old_values["lu"].get(fuel), ("lu", fuel) in changed))
+        lines.append(price_line("🇧🇪", entries["be"], old_values["be"].get(fuel), ("be", fuel) in changed))
+        lines.append(fr_price_line(fuel, entries["fr"]))
         lines.append("")
 
     return "⛽️ Alerte Carburants", "\n".join(lines).strip()
@@ -616,14 +772,14 @@ def main():
     log("Vérification des prix…")
     cache = load_cache()
     alerts = Alerts(cache, now)
-    results = fetch_all()
+    results = fetch_all(MAIN_SOURCES)
 
     for name, result in results.items():
         update_source_health(cache, alerts, name, result, now)
 
     # Valeurs connues (cache) puis remplacées par les valeurs fraîches des sources OK.
-    current = {"lu": {}, "be": {}}
-    for country in ("lu", "be"):
+    current = {"lu": {}, "be": {}, "fr": {}}
+    for country in ("lu", "be", "fr"):
         for fuel, entry in cache["prices"][country].items():
             current[country][fuel] = {
                 "value": Decimal(entry["value"]),
@@ -655,6 +811,17 @@ def main():
     if changed:
         log(f"  🚨 Changement détecté : "
             + ", ".join(f"{c.upper()} {FUEL_LABELS[f]}" for c, f in changed))
+        # La France n'est interrogée qu'au moment d'envoyer une notif (affichage seulement).
+        for name, result in fetch_all(FR_SOURCES).items():
+            update_source_health(cache, alerts, name, result, now)
+            if isinstance(result, SourceError):
+                log("  🇫🇷 Valeurs précédentes conservées pour cette source.")
+                continue
+            prices, dates = result
+            log(f"  ✅ {SOURCES[name]['label']} : "
+                + ", ".join(f"{FUEL_LABELS[f]} {fmt_price(v)}" for f, v in prices.items()))
+            for fuel, value in prices.items():
+                current["fr"][fuel] = {"value": value, "date": dates.get(fuel)}
         title, message = build_notification(current, old_values, changed)
         ok, error = send_ntfy(NTFY_URL, title, message, priority="high",
                               tags="fuelpump,rotating_light")
@@ -668,7 +835,7 @@ def main():
         log("  Aucun changement de prix.")
 
     if commit_prices:
-        for country in ("lu", "be"):
+        for country in ("lu", "be", "fr"):
             cache["prices"][country] = {
                 fuel: {"value": str(e["value"]), "date": e["date"].isoformat() if e["date"] else None}
                 for fuel, e in current[country].items()
