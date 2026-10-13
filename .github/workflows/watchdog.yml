@@ -1,0 +1,31 @@
+name: Watchdog
+ 
+# Filet de sécurité : si la chaîne des 5 minutes s'est arrêtée
+# (panne GitHub), il la relance.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+ 
+permissions:
+  actions: write
+ 
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Vérifier la chaîne des 5 minutes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          active=$(gh run list --workflow check.yml --limit 20 --json status \
+            --jq '[.[] | select(.status != "completed")] | length')
+          if [ "$active" -gt 0 ]; then
+            echo "Chaîne active ($active run en cours ou en attente). Rien à faire."
+            exit 0
+          fi
+          last_seen=$(gh run list --workflow check.yml --limit 1 --json updatedAt --jq '.[0].updatedAt // ""')
+          echo "Chaîne arrêtée (dernier run : ${last_seen:-aucun}). Relance."
+          gh workflow run check.yml --ref "$GITHUB_REF_NAME" -f revived=true -f last_seen="$last_seen"
