@@ -1,0 +1,34 @@
+name: Test des alertes
+ 
+# À lancer à la main uniquement : envoie un mail URGENT de test
+# et une alerte sur le canal technique ntfy.
+on:
+  workflow_dispatch:
+ 
+permissions:
+  contents: read
+ 
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+ 
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+ 
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+ 
+      - name: Envoyer les alertes de test
+        env:
+          NTFY_ALERT_URL: ${{ secrets.NTFY_ALERT_URL }}
+          MAIL_ADDRESS: ${{ secrets.MAIL_ADDRESS }}
+          MAIL_APP_PASSWORD: ${{ secrets.MAIL_APP_PASSWORD }}
+        run: python test_alert.py
+ 
