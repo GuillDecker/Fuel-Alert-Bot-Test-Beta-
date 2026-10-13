@@ -1,14 +1,59 @@
 {
-  "lu": {
-    "sp95": 1.876,
-    "sp98": 2.081,
-    "diesel": 2.081,
-    "mazout": 1.575
+  "health": {
+    "carbu_lu": {
+      "fails": 0,
+      "last_error": null,
+      "since": null
+    },
+    "petrol_lu": {
+      "fails": 0,
+      "last_error": null,
+      "since": null
+    },
+    "spf_be": {
+      "fails": 0,
+      "last_error": null,
+      "since": null
+    }
   },
-  "be": {
-    "sp95": 2.105,
-    "sp98": 2.299,
-    "diesel": 2.428,
-    "mazout": 1.528
-  }
+  "incidents": {},
+  "prices": {
+    "be": {
+      "diesel": {
+        "date": "2026-10-14",
+        "value": "2.4280"
+      },
+      "mazout": {
+        "date": "2026-10-14",
+        "value": "1.5282"
+      },
+      "sp95": {
+        "date": "2026-10-14",
+        "value": "2.1050"
+      },
+      "sp98": {
+        "date": "2026-10-14",
+        "value": "2.2990"
+      }
+    },
+    "lu": {
+      "diesel": {
+        "date": "2026-10-13",
+        "value": "2.081"
+      },
+      "mazout": {
+        "date": "2026-10-13",
+        "value": "1.575"
+      },
+      "sp95": {
+        "date": "2026-10-13",
+        "value": "1.876"
+      },
+      "sp98": {
+        "date": "2026-10-13",
+        "value": "2.081"
+      }
+    }
+  },
+  "version": 2
 }
