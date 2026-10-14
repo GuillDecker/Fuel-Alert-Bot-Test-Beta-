@@ -62,11 +62,13 @@ CHAIN_GAP_ALERT_MIN = 10     # trou dans la chaîne au-delà duquel on alerte
 
 FR_MAX_AGE_DAYS = 7          # prix de station plus vieux → ignoré (station fermée, abandonnée)
 FR_MIN_STATIONS = 500        # en dessous, la médiane n'est pas fiable → échec de la source
+FR_MIN_STATIONS_AUTOROUTE = 100  # beaucoup moins de stations d'autoroute que de stations sur route
 FR_FAIL_THRESHOLD = 3        # la France n'est interrogée qu'à chaque notif → 3 échecs d'affilée
 
 FUELS = ("diesel", "sp95", "sp98", "mazout")
 CARBURANTS = ("diesel", "sp95", "sp98")
-FUEL_LABELS = {"diesel": "Diesel", "sp95": "SP95", "sp98": "SP98", "mazout": "Mazout"}
+FUEL_LABELS = {"diesel": "Diesel", "sp95": "SP95", "sp98": "SP98", "mazout": "Mazout",
+               "diesel_a": "Diesel autoroute", "sp95_a": "SP95 autoroute", "sp98_a": "SP98 autoroute"}
 
 SOURCES = {
     "carbu_lu": {
@@ -327,7 +329,9 @@ def parse_spf_be(html):
 
 def parse_fr_stations(raw):
     """Flux officiel des ~10 000 stations françaises : médiane des prix des stations
-    hors autoroute (pop = "R"), mis à jour depuis moins de FR_MAX_AGE_DAYS jours."""
+    hors autoroute (pop = "R") et, séparément, des stations d'autoroute (pop = "A").
+    Même méthode pour les deux : prix de moins de FR_MAX_AGE_DAYS jours, ruptures et
+    valeurs aberrantes exclues. Clés : diesel/sp95/sp98 (route), diesel_a/sp95_a/sp98_a."""
     try:
         data = json.loads(raw)
     except ValueError as e:
@@ -339,10 +343,11 @@ def parse_fr_stations(raw):
 
     keys = {"diesel": "gazole", "sp95": "e10", "sp98": "sp98"}
     cutoff = datetime.now(timezone.utc) - timedelta(days=FR_MAX_AGE_DAYS)
-    values = {fuel: [] for fuel in keys}
+    values = {fuel + suffix: [] for suffix in ("", "_a") for fuel in keys}
     for station in data:
-        if not isinstance(station, dict) or station.get("pop") != "R":
+        if not isinstance(station, dict) or station.get("pop") not in ("R", "A"):
             continue
+        suffix = "" if station.get("pop") == "R" else "_a"
         for fuel, key in keys.items():
             price, updated = station.get(f"{key}_prix"), station.get(f"{key}_maj")
             if price is None or not updated:
@@ -358,13 +363,14 @@ def parse_fr_stations(raw):
                 when = when.replace(tzinfo=timezone.utc)
             if when < cutoff or not (PRICE_MIN <= price <= PRICE_MAX):
                 continue  # prix périmé ou aberrant d'une station isolée : ignoré
-            values[fuel].append(price)
+            values[fuel + suffix].append(price)
 
     prices = {}
     for fuel, vals in values.items():
-        if len(vals) < FR_MIN_STATIONS:
+        minimum = FR_MIN_STATIONS_AUTOROUTE if fuel.endswith("_a") else FR_MIN_STATIONS
+        if len(vals) < minimum:
             raise SourceError(f"Trop peu de stations à jour pour le {FUEL_LABELS[fuel]} "
-                              f"sur prix-carburants.gouv.fr ({len(vals)}, minimum {FR_MIN_STATIONS})")
+                              f"sur prix-carburants.gouv.fr ({len(vals)}, minimum {minimum})")
         prices[fuel] = check_range("fr_stations", fuel, statistics.median(vals))
     log("  🇫🇷 Stations retenues : "
         + ", ".join(f"{FUEL_LABELS[f]} {len(v)}" for f, v in values.items()))
@@ -438,7 +444,8 @@ def fetch_all(names):
 
 # ─── Cache ──────────────────────────────────────────────────────────
 def empty_cache():
-    return {"version": 2, "prices": {"lu": {}, "be": {}, "fr": {}}, "health": {}, "incidents": {}}
+    return {"version": 2, "prices": {"lu": {}, "be": {}, "fr": {}}, "health": {}, "incidents": {},
+            "fioul_watch": {}}
 
 
 def load_cache():
@@ -678,19 +685,25 @@ def date_line(flag, entries):
     return f"📅 {flag} {carb} · Mazout dès le {fmt_date(d('mazout'))}"
 
 
-def fr_date_line(entries):
+def fr_date_line(entries, fioul_published=None):
     def d(fuel):
         entry = entries.get(fuel)
         return entry["date"] if entry else None
-    return (f"📅 🇫🇷 Carburants relevés le {fmt_date(d('diesel'))} · "
-            f"Mazout : semaine du {fmt_date(d('mazout'))}")
+    mazout = f"Mazout : prix du {fmt_date(d('mazout'))}"
+    if fioul_published:
+        mazout += f", publié le {fmt_date(fioul_published)}"
+    return f"📅 🇫🇷 Carburants relevés le {fmt_date(d('diesel'))} · {mazout}"
 
 
-def fr_price_line(fuel, entry):
-    if entry is None:
-        return "🇫🇷 n/d"
-    label = "moyenne nationale" if fuel == "mazout" else "prix typique, hors autoroute"
-    return f"🇫🇷 {fmt_price(entry['value'])} ({label})"
+def fr_lines(fuel, current_fr, old_fr):
+    """Lignes France : hausse/baisse calculée depuis la notif précédente, comme LU/BE."""
+    def line(key, suffix):
+        entry, old = current_fr.get(key), old_fr.get(key)
+        changed = entry is not None and old is not None and trunc3(entry["value"]) != trunc3(old)
+        return f"{price_line('🇫🇷', entry, old, changed)} {suffix}"
+    if fuel == "mazout":
+        return [line("mazout", "moyenne nationale")]
+    return [line(fuel, "hors autoroute"), line(fuel + "_a", "sur autoroute 🛣️")]
 
 
 def trophy(entries):
@@ -718,7 +731,7 @@ def price_line(flag, entry, old, changed):
     return f"{flag} {fmt_price(value)} ({status})"
 
 
-def build_notification(current, old_values, changed):
+def build_notification(current, old_values, changed, fioul_published=None):
     lu_changed = any(country == "lu" for country, _ in changed)
     be_changed = any(country == "be" for country, _ in changed)
     if lu_changed and be_changed:
@@ -731,7 +744,7 @@ def build_notification(current, old_values, changed):
     lines = [subtitle, "",
              date_line("🇱🇺", current["lu"]),
              date_line("🇧🇪", current["be"]),
-             fr_date_line(current["fr"]),
+             fr_date_line(current["fr"], fioul_published),
              ""]
 
     for fuel, emoji, label in (("diesel", "🟡", "DIESEL"), ("sp95", "🟢", "SP95"),
@@ -741,7 +754,7 @@ def build_notification(current, old_values, changed):
         lines.append(f"{emoji} {label} | {winner}" if winner else f"{emoji} {label}")
         lines.append(price_line("🇱🇺", entries["lu"], old_values["lu"].get(fuel), ("lu", fuel) in changed))
         lines.append(price_line("🇧🇪", entries["be"], old_values["be"].get(fuel), ("be", fuel) in changed))
-        lines.append(fr_price_line(fuel, entries["fr"]))
+        lines.extend(fr_lines(fuel, current["fr"], old_values["fr"]))
         lines.append("")
 
     return "⛽️ Alerte Carburants", "\n".join(lines).strip()
@@ -772,10 +785,27 @@ def main():
     log("Vérification des prix…")
     cache = load_cache()
     alerts = Alerts(cache, now)
-    results = fetch_all(MAIN_SOURCES)
+    results = fetch_all(MAIN_SOURCES + ("fr_fioul",))
+    fioul_result = results.pop("fr_fioul")
 
     for name, result in results.items():
         update_source_health(cache, alerts, name, result, now)
+
+    # Surveillance du Bulletin pétrolier à chaque run (14 Ko), uniquement pour dater sa
+    # publication. Un échec ici ne compte pas : seuls les échecs au moment des notifs comptent.
+    watch = cache.setdefault("fioul_watch", {})
+    if isinstance(fioul_result, SourceError):
+        log(f"  ℹ️ Bulletin pétrolier non consulté ce run : {fioul_result}")
+    else:
+        bulletin_date = fioul_result[1].get("mazout")
+        bulletin_iso = bulletin_date.isoformat() if bulletin_date else None
+        if bulletin_iso and watch.get("bulletin_date") != bulletin_iso:
+            first_seen = bool(watch)  # au tout premier passage, la date de publication est inconnue
+            watch.clear()
+            watch["bulletin_date"] = bulletin_iso
+            watch["published"] = now.date().isoformat() if first_seen else None
+            log(f"  🇫🇷 Nouveau Bulletin pétrolier (prix du {fmt_date(bulletin_date)})"
+                + (f", publié le {fmt_date(now.date())}." if first_seen else " — date de publication inconnue."))
 
     # Valeurs connues (cache) puis remplacées par les valeurs fraîches des sources OK.
     current = {"lu": {}, "be": {}, "fr": {}}
@@ -812,7 +842,9 @@ def main():
         log(f"  🚨 Changement détecté : "
             + ", ".join(f"{c.upper()} {FUEL_LABELS[f]}" for c, f in changed))
         # La France n'est interrogée qu'au moment d'envoyer une notif (affichage seulement).
-        for name, result in fetch_all(FR_SOURCES).items():
+        fr_results = fetch_all(("fr_stations",))
+        fr_results["fr_fioul"] = fioul_result
+        for name, result in fr_results.items():
             update_source_health(cache, alerts, name, result, now)
             if isinstance(result, SourceError):
                 log("  🇫🇷 Valeurs précédentes conservées pour cette source.")
@@ -822,7 +854,12 @@ def main():
                 + ", ".join(f"{FUEL_LABELS[f]} {fmt_price(v)}" for f, v in prices.items()))
             for fuel, value in prices.items():
                 current["fr"][fuel] = {"value": value, "date": dates.get(fuel)}
-        title, message = build_notification(current, old_values, changed)
+        mazout_fr = current["fr"].get("mazout")
+        fioul_published = None
+        if (mazout_fr and mazout_fr["date"] and watch.get("published")
+                and watch.get("bulletin_date") == mazout_fr["date"].isoformat()):
+            fioul_published = date.fromisoformat(watch["published"])
+        title, message = build_notification(current, old_values, changed, fioul_published)
         ok, error = send_ntfy(NTFY_URL, title, message, priority="high",
                               tags="fuelpump,rotating_light")
         update_ntfy_health(cache, alerts, ok, error, now)
