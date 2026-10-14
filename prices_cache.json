@@ -5,6 +5,21 @@
       "last_error": null,
       "since": null
     },
+    "fr_fioul": {
+      "fails": 0,
+      "last_error": null,
+      "since": null
+    },
+    "fr_stations": {
+      "fails": 0,
+      "last_error": null,
+      "since": null
+    },
+    "ntfy": {
+      "fails": 0,
+      "last_error": null,
+      "since": null
+    },
     "petrol_lu": {
       "fails": 0,
       "last_error": null,
@@ -20,23 +35,40 @@
   "prices": {
     "be": {
       "diesel": {
-        "date": "2026-10-14",
+        "date": "2026-10-15",
         "value": "2.4280"
       },
       "mazout": {
+        "date": "2026-10-15",
+        "value": "1.5666"
+      },
+      "sp95": {
+        "date": "2026-10-15",
+        "value": "2.0640"
+      },
+      "sp98": {
+        "date": "2026-10-15",
+        "value": "2.2010"
+      }
+    },
+    "fr": {
+      "diesel": {
         "date": "2026-10-14",
-        "value": "1.5282"
+        "value": "2.349"
+      },
+      "mazout": {
+        "date": "2026-10-05",
+        "value": "1.90708"
       },
       "sp95": {
         "date": "2026-10-14",
-        "value": "2.1050"
+        "value": "2.179"
       },
       "sp98": {
         "date": "2026-10-14",
-        "value": "2.2990"
+        "value": "2.289"
       }
     },
-    "fr": {},
     "lu": {
       "diesel": {
         "date": "2026-10-13",
